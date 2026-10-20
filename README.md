@@ -1,4 +1,4 @@
-# Agent Repay-First Payees (draft ERC)
+# ERC-8451: Agent Repay-First Payees (draft)
 
 A revenue address for an agent identity that pays its creditors before its owner. The agent uses the payee as the
 address where it is paid (an x402 `payTo`, an ERC-8183 job's provider, an ERC-8004 payment wallet). When anyone sweeps
@@ -10,10 +10,9 @@ An optional section, "Paying holders after creditors", lets an agent pay the hol
 token from what its creditors leave: the token is the payee's beneficiary, never a creditor, and books what a sweep
 sends it with `syncFromPayee`, so lenders stay senior and holders come last.
 
-**Status: draft, not submitted.** The text is in
-[`ERCS/erc-draft_repay_first_payees.md`](ERCS/erc-draft_repay_first_payees.md). Its `eip: 99902` is a placeholder: the
-ERC editors assign the real number when the pull request is opened on ethereum/ERCs. Discussion will open on Ethereum
-Magicians first.
+**Status: draft, not submitted.** The text is in [`ERCS/erc-8451.md`](ERCS/erc-8451.md). ERC-8451 is the next number
+that was free on 2026-10-20; the ERC editors confirm it, or assign another, when the pull request is opened on
+ethereum/ERCs. Discussion opens on Ethereum Magicians first.
 
 ## Why
 
@@ -26,7 +25,7 @@ lenders share a revenue address in a clear order, and lets payers, explorers and
 
 | Path | What |
 |---|---|
-| `ERCS/erc-draft_repay_first_payees.md` | The ERC text, in the ethereum/ERCs template |
+| `ERCS/erc-8451.md` | The ERC text, in the ethereum/ERCs template |
 | `src/IRepayFirstPayee.sol` | The payee and creditor interfaces |
 | `src/RepayFirstPayee.sol` | A reference payee, and a factory that deploys one per agent at a CREATE2 address (not audited) |
 | `test/RepayFirstPayee.t.sol` | Foundry tests, with failing, greedy and gas-burning creditors |
@@ -48,11 +47,9 @@ CI runs all three on every push (`.github/workflows/ci.yml`).
 
 ## Related drafts
 
-- Agent Credit Lines: one interface to borrow, repay and default against any lender to agent identities (to be
-  published as github.com/priors-agents/erc-agent-credit-lines). A lender implementing it implements a creditor here
-  with a few lines.
-- Agent Default Registry: lender-reported defaults any contract can check (to be published as
-  github.com/priors-agents/erc-agent-default-registry).
+- ERC-8450 Agent Credit Lines: one interface to borrow, repay and default against any lender to agent identities
+  (github.com/priors-agents/ERC-8450). A lender implementing it implements a creditor here with a few lines.
+- ERC-8452 Agent Default Registry: lender-reported defaults any contract can check (github.com/priors-agents/ERC-8452).
 
 ## Licence
 
