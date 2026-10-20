@@ -1,0 +1,222 @@
+// SPDX-License-Identifier: CC0-1.0
+pragma solidity ^0.8.20;
+
+import {IRepayFirstPayee, IRepayFirstCreditor} from "./IRepayFirstPayee.sol";
+
+interface IERC20Approve {
+    function balanceOf(address account) external view returns (uint256);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function approve(address spender, uint256 amount) external returns (bool);
+}
+
+interface IERC721OwnerOf {
+    function ownerOf(uint256 tokenId) external view returns (address);
+}
+
+interface IERC165 {
+    function supportsInterface(bytes4 interfaceId) external view returns (bool);
+}
+
+/// @title RepayFirstPayee
+/// @notice Reference implementation of the Agent Repay-First Payees draft. One payee per agent, deployed at a CREATE2
+///         address by `RepayFirstPayeeFactory`. Each creditor is called with a fixed gas budget, so one that fails or
+///         burns gas is skipped and the rest of the sweep goes on.
+/// @dev Not audited. A reference for the interface, not a contract to hold real revenue.
+contract RepayFirstPayee is IRepayFirstPayee, IERC165 {
+    uint256 public constant MAX_CREDITORS = 8;
+    uint16 public constant BPS = 10_000;
+    /// @notice Gas given to a creditor's `amountOwed` and `hasClaim`, and to its `collect`.
+    uint256 public constant VIEW_GAS = 50_000;
+    uint256 public constant COLLECT_GAS = 300_000;
+
+    IERC721OwnerOf private immutable _registry;
+    uint256 private immutable _agentId;
+
+    address private _beneficiary;
+    address private _beneficiarySetBy; // the owner who chose `_beneficiary`; the choice holds only while it owns
+    address[] private _creditors;
+    mapping(address => uint16) private _share;
+    bool private _locked;
+
+    error NotOwner();
+    error BadCreditor();
+    error BadShare();
+    error TooManyCreditors();
+    error CreditorHasClaim();
+    error Reentrant();
+    error TransferFailed();
+
+    modifier lock() {
+        if (_locked) revert Reentrant();
+        _locked = true;
+        _;
+        _locked = false;
+    }
+
+    modifier onlyOwner() {
+        if (_registry.ownerOf(_agentId) != msg.sender) revert NotOwner();
+        _;
+    }
+
+    constructor(address registry_, uint256 agentId_) {
+        _registry = IERC721OwnerOf(registry_);
+        _agentId = agentId_;
+    }
+
+    // ---------------------------------------------------------------- views
+
+    function identityRegistry() external view returns (address) {
+        return address(_registry);
+    }
+
+    function agentId() external view returns (uint256) {
+        return _agentId;
+    }
+
+    /// @dev A beneficiary set by an owner counts only while that owner holds the identity, so a seller cannot keep the
+    ///      revenue earned after a sale. When the registry cannot name an owner (a burned identity), the last choice
+    ///      stands, and with none the result is the zero address: `sweep` then still pays the creditors and keeps the
+    ///      rest.
+    function beneficiary() public view returns (address) {
+        try _registry.ownerOf(_agentId) returns (address owner) {
+            if (_beneficiary != address(0) && owner == _beneficiarySetBy) return _beneficiary;
+            return owner;
+        } catch {
+            return _beneficiary;
+        }
+    }
+
+    function creditors() external view returns (address[] memory) {
+        return _creditors;
+    }
+
+    function maxShareBps(address creditor) external view returns (uint16) {
+        return _share[creditor];
+    }
+
+    function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
+        return interfaceId == type(IRepayFirstPayee).interfaceId || interfaceId == type(IERC165).interfaceId;
+    }
+
+    // ---------------------------------------------------------------- configuration
+
+    function addCreditor(address creditor, uint16 maxShareBps_) external lock onlyOwner {
+        if (creditor == address(0) || creditor == address(this) || _share[creditor] != 0) revert BadCreditor();
+        if (maxShareBps_ == 0 || maxShareBps_ > BPS) revert BadShare();
+        if (_creditors.length >= MAX_CREDITORS) revert TooManyCreditors();
+        _creditors.push(creditor);
+        _share[creditor] = maxShareBps_;
+        emit CreditorAdded(creditor, maxShareBps_);
+    }
+
+    function removeCreditor(address creditor) external lock {
+        if (_share[creditor] == 0) revert BadCreditor();
+        if (msg.sender != creditor) {
+            if (_registry.ownerOf(_agentId) != msg.sender) revert NotOwner();
+            if (_hasClaim(creditor)) revert CreditorHasClaim();
+        }
+        uint256 n = _creditors.length;
+        for (uint256 i; i < n; ++i) {
+            if (_creditors[i] == creditor) {
+                for (uint256 j = i; j + 1 < n; ++j) {
+                    _creditors[j] = _creditors[j + 1]; // keep seniority order
+                }
+                _creditors.pop();
+                break;
+            }
+        }
+        delete _share[creditor];
+        emit CreditorRemoved(creditor);
+    }
+
+    function setBeneficiary(address beneficiary_) external lock onlyOwner {
+        _beneficiary = beneficiary_;
+        _beneficiarySetBy = msg.sender; // onlyOwner: the current owner
+        emit BeneficiarySet(beneficiary_);
+    }
+
+    // ---------------------------------------------------------------- sweep
+
+    function sweep(address token) external lock returns (uint256 toCreditors, uint256 forwarded) {
+        IERC20Approve t = IERC20Approve(token);
+        uint256 total = t.balanceOf(address(this));
+        if (total == 0) return (0, 0);
+
+        uint256 remaining = total;
+        uint256 n = _creditors.length;
+        for (uint256 i; i < n && remaining > 0; ++i) {
+            address c = _creditors[i];
+            uint256 give = _owed(c, token);
+            uint256 cap = total * _share[c] / BPS;
+            if (give > cap) give = cap;
+            if (give > remaining) give = remaining;
+            if (give == 0) continue;
+
+            uint256 before = t.balanceOf(address(this));
+            if (!t.approve(c, give)) revert TransferFailed();
+            try IRepayFirstCreditor(c).collect{gas: COLLECT_GAS}(_agentId, token, give) {} catch {}
+            if (!t.approve(c, 0)) revert TransferFailed();
+
+            // What the creditor took: the fall in balance, at most `give` by the allowance. Tokens sent in meanwhile
+            // stay for the next sweep.
+            uint256 after_ = t.balanceOf(address(this));
+            uint256 taken = after_ < before ? before - after_ : 0;
+            toCreditors += taken;
+            remaining -= taken;
+        }
+
+        address to = beneficiary();
+        if (to != address(0)) {
+            forwarded = remaining;
+            if (forwarded > 0 && !t.transfer(to, forwarded)) revert TransferFailed();
+        }
+        emit Swept(token, toCreditors, forwarded);
+    }
+
+    function _owed(address creditor, address token) private view returns (uint256 owed) {
+        try IRepayFirstCreditor(creditor).amountOwed{gas: VIEW_GAS}(_agentId, token) returns (uint256 o) {
+            owed = o;
+        } catch {}
+    }
+
+    /// @dev A creditor whose `hasClaim` fails is treated as having one: the owner cannot drop a lender by making its
+    ///      check revert.
+    function _hasClaim(address creditor) private view returns (bool) {
+        try IRepayFirstCreditor(creditor).hasClaim{gas: VIEW_GAS}(_agentId) returns (bool h) {
+            return h;
+        } catch {
+            return true;
+        }
+    }
+}
+
+/// @title RepayFirstPayeeFactory
+/// @notice Deploys one payee per agent at an address known before deployment, so an agent can advertise it as its
+///         revenue address first.
+contract RepayFirstPayeeFactory {
+    address public immutable registry;
+
+    event PayeeDeployed(uint256 indexed agentId, address payee);
+
+    error AlreadyDeployed(address payee);
+
+    constructor(address registry_) {
+        registry = registry_;
+    }
+
+    function payeeOf(uint256 agentId) public view returns (address) {
+        bytes32 initHash =
+            keccak256(abi.encodePacked(type(RepayFirstPayee).creationCode, abi.encode(registry, agentId)));
+        return
+            address(
+                uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(this), bytes32(agentId), initHash))))
+            );
+    }
+
+    function deploy(uint256 agentId) external returns (address payee) {
+        address existing = payeeOf(agentId);
+        if (existing.code.length != 0) revert AlreadyDeployed(existing);
+        payee = address(new RepayFirstPayee{salt: bytes32(agentId)}(registry, agentId));
+        emit PayeeDeployed(agentId, payee);
+    }
+}
