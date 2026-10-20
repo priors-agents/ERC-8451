@@ -12,7 +12,8 @@ sends it with `syncFromPayee`, so lenders stay senior and holders come last.
 
 **Status: draft, not submitted.** The text is in [`ERCS/erc-8451.md`](ERCS/erc-8451.md). ERC-8451 is the next number
 that was free on 2026-10-20; the ERC editors confirm it, or assign another, when the pull request is opened on
-ethereum/ERCs. Discussion opens on Ethereum Magicians first.
+ethereum/ERCs. Discussion:
+[Ethereum Magicians](https://ethereum-magicians.org/t/erc-8451-agent-repay-first-payees/30025).
 
 ## Why
 
