@@ -8,7 +8,7 @@ status: Draft
 type: Standards Track
 category: ERC
 created: 2026-10-20
-requires: 20, 165, 721
+requires: 20, 165, 721, 7254
 ---
 
 ## Abstract
@@ -18,7 +18,9 @@ uses as the address where it is paid. When the payee is swept, it pays each regi
 it is owed, most senior first and up to a share of the swept balance the creditor agreed to, and forwards the rest to the
 agent's owner or an address the owner chose. The owner adds creditors, each junior to the ones before, and cannot remove
 a creditor that still has a claim. A small creditor interface lets any lender take part, and any payer, explorer or
-lender can tell that an identity's revenue address is encumbered.
+lender can tell that an identity's revenue address is encumbered. An optional part lets the holders of an
+[ERC-7254](./eip-7254.md) revenue-sharing token share what the creditors leave, with the token as the payee's
+beneficiary.
 
 ## Motivation
 
@@ -115,6 +117,44 @@ SHOULD call each creditor with a bounded amount of gas, so that one creditor can
 - `collect(agentId, token, amount)` MUST take at most `amount` of `token` from the calling payee and apply it to what
   the identity owes; it MUST return the amount taken.
 
+### Paying holders after creditors (optional)
+
+An agent can pay the holders of a token from what its creditors leave. The token implements `IHoldersAfterCreditors`
+and ERC-7254, under which holders accrue rewards in registered reward assets and withdraw them with `getReward`. The
+owner sets the token as the payee's beneficiary with `setBeneficiary`. A token that implements
+`IHoldersAfterCreditors` MUST implement ERC-7254 and ERC-165, returning `true` for the interface identifier of
+`IHoldersAfterCreditors` and for `0x01ffc9a7`.
+
+```solidity
+interface IHoldersAfterCreditors {
+    event RevenueFromPayee(address indexed payee, address indexed asset, uint256 amount);
+
+    function payee() external view returns (address);
+    function syncFromPayee(address asset) external returns (uint256 booked);
+}
+```
+
+- The token's place is the payee's beneficiary, never one of its creditors. The token MUST NOT implement
+  `IRepayFirstCreditor`, so that a payee that lists it as a creditor finds it owed nothing.
+- `payee()` MUST return the agent's payee and MUST NOT change.
+- `syncFromPayee(asset)` MUST be callable by any account. What it books is the amount by which the token's balance of
+  `asset` exceeds what the token already accounts for: what earlier syncs and `updateReward` calls booked, less what
+  holders withdrew. It MUST book that amount as ERC-7254 rewards of `asset`, raising the reward per share by the amount
+  divided by `totalSupply()` as `updateReward` does, and MUST return it. Each unit MUST be booked once: a second sync
+  with nothing new received books nothing, and what `updateReward` brought in is not booked again.
+- `syncFromPayee` MUST emit `RevenueFromPayee` with `payee()`, `asset` and the amount booked when that amount is not
+  zero, and only then. `updateReward` MUST NOT emit `RevenueFromPayee`.
+- `syncFromPayee(asset)` MUST revert if `existsTokenReward(asset)` returns `false`.
+- When `totalSupply()` is zero, `syncFromPayee` MUST book nothing and return `0`. What the token holds stays unbooked,
+  and the first sync at a non-zero supply books it.
+- `syncFromPayee` MUST NOT revert because the payee's `beneficiary()` is not the token. It books what reached the token,
+  including what sweeps forwarded while the token was the beneficiary, and nothing that a sweep sent elsewhere.
+
+A beneficiary set by an owner holds only while that owner holds the identity. After a sale, sweeps forward what is left
+to the new owner, not to the token, until the new owner calls `setBeneficiary` with the token. Holders SHOULD check that
+the payee's `beneficiary()` returns the token, and read its `creditors()` and their shares, before counting on the
+agent's revenue.
+
 ## Rationale
 
 - **Plain transfers in, sweeps out.** HTTP payments signed with ERC-3009 and job payouts are plain token transfers that
@@ -135,6 +175,24 @@ SHOULD call each creditor with a bounded amount of gas, so that one creditor can
 - **The identity, not the owner.** The payee belongs to the identity; after a transfer the new owner controls it but
   inherits its creditors. Whether a debt follows the identity or its former owner is each creditor's choice, expressed
   through `amountOwed` and `hasClaim`.
+- **Holders as the beneficiary.** With seniority by order of addition, a token added as a creditor would rank ahead of
+  every lender added after it, the opposite of holders last. As the beneficiary, the token receives only what every
+  creditor, present or future, left. A splitter that pays fixed tranches in order before a residual recipient gives the
+  same order for debts fixed once; here lenders join and leave, and holders stay last.
+- **A sync, not a pull.** ERC-7254 books rewards only through `updateReward`, which pulls them from its caller. A sweep
+  is a plain transfer that calls nothing on the receiver, so the token books what arrived when anyone calls
+  `syncFromPayee`, and the payee needs no change.
+- **A marker, not a total.** `updateReward` stays open to anyone, so a token's rewards can come from elsewhere.
+  `RevenueFromPayee` separates what arrived by plain transfer, which for a token set as beneficiary is what the payee
+  forwarded.
+- **Registered assets only.** ERC-7254 adjusts holders' entries on each transfer only for its registered reward assets.
+  Booking another asset would let a holder claim it again after receiving tokens. `updateReward` refuses such assets
+  too.
+- **No booking without holders.** At zero supply there is nobody to share among and no reward per share to compute.
+  Leaving the balance unbooked keeps it for the first holders.
+- **The token's place lapses with the owner.** The rule that a beneficiary holds only while its owner holds the
+  identity has no exception for a token. Otherwise a seller holding most of a token could set it as beneficiary before
+  selling and keep a share of the revenue the buyer earns.
 
 ## Backwards Compatibility
 
@@ -160,11 +218,34 @@ A conforming payee passes these cases, each for one identity whose owner receive
 - After the identity is burned, with no beneficiary set, a sweep of 100 units with one creditor owed 30 units pays it 30
   units, forwards nothing, and leaves 70 units in the payee.
 
+A token implementing the optional part passes these cases, with the token as the beneficiary and two holders of 75%
+and 25% of its supply:
+
+- With one creditor owed 20 units, a sweep of 100 units pays it 20 units and forwards 80 units to the token; a sync by
+  any account books 80 units, of which the holders can withdraw 60 and 20 units.
+- A second sync with nothing new received books nothing. After the holders withdraw, a forward of 40 units is booked as
+  40 units.
+- A sync that books 80 units emits `RevenueFromPayee` with the payee, the asset and 80 units; a sync that books nothing
+  emits nothing.
+- An `updateReward` of 10 units by another account is shared by the holders, emits no `RevenueFromPayee`, and is not
+  booked again by the next sync.
+- A sync of an asset the token does not reward reverts.
+- At zero supply a sync books nothing; once tokens are minted, the next sync books the whole balance, once.
+- The owner lists the token as a creditor ahead of a lender owed 30 units; a sweep of 100 units pays the lender 30
+  units, the token nothing as a creditor, and forwards 70 units to the token as the beneficiary.
+- After the identity is sold, a sweep of 100 units with a creditor owed 20 units forwards 80 units to the buyer, and a
+  sync books nothing without reverting. Once the buyer sets the token as beneficiary, the next sweep's rest is booked.
+- A sync after a sale still books what sweeps forwarded to the token before the sale.
+
 ## Reference Implementation
 
 `RepayFirstPayee` and a factory that deploys one payee per identity at a CREATE2 address known before deployment
 accompany this proposal with their tests. The payee calls each creditor with a fixed gas budget and holds at most eight
 creditors.
+
+`HoldersAfterCreditorsToken`, an ERC-20 token that implements ERC-7254 and `IHoldersAfterCreditors`, accompanies the
+optional part with its tests. Its reward assets are fixed when it is deployed. Unlike ERC-7254's own reference, which
+counts the remainder below one unit of a claim as withdrawn, it keeps that remainder claimable.
 
 ## Security Considerations
 
@@ -182,6 +263,18 @@ creditors.
 - **A burned identity.** With no owner to read, no one can configure the payee. Sweeps still pay the creditors, and
   what is left stays in the payee rather than being sent to the zero address. Owners who may burn an identity SHOULD
   set a beneficiary first.
+- **Holders are paid last, and only by the owner's choice.** A token receives only what every creditor leaves, and the
+  owner can add creditors with shares up to `10000`, which can leave holders nothing. The owner can point the
+  beneficiary elsewhere at any time, and a sale ends its choice of the token. Holders SHOULD read the payee's
+  `beneficiary()`, `creditors()` and their shares, and treat the revenue as junior and revocable.
+- **`RevenueFromPayee` counts any plain transfer.** A sync cannot tell a sweep from another transfer, so anyone can raise
+  the figure by sending the asset to the token, at the cost of giving it to the holders. Readers that need the agent's
+  revenue alone SHOULD sum the `forwarded` amounts of the payee's `Swept` events while its `beneficiary()` was the
+  token.
+- **Timing of syncs.** Revenue is booked to whoever holds the token at the sync. Since anyone may sweep and sync, a buyer
+  can buy just before a sweep and a sync and sell after. Frequent syncs make each one smaller.
+- **Assets the token does not reward.** A payee forwards every asset it is swept in. An asset the token does not reward
+  is not booked and stays in the token. Token deployers SHOULD register every asset the agent is paid in.
 
 ## Copyright
 

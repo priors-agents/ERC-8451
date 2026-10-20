@@ -6,6 +6,10 @@ it, each creditor gets what it is owed, most senior first and up to its agreed s
 the agent's owner. The owner cannot drop a creditor that is still owed, which is what makes the revenue worth lending
 against.
 
+An optional section, "Paying holders after creditors", lets an agent pay the holders of an ERC-7254 revenue-sharing
+token from what its creditors leave: the token is the payee's beneficiary, never a creditor, and books what a sweep
+sends it with `syncFromPayee`, so lenders stay senior and holders come last.
+
 **Status: draft, not submitted.** The text is in
 [`ERCS/erc-draft_repay_first_payees.md`](ERCS/erc-draft_repay_first_payees.md). Its `eip: 99902` is a placeholder: the
 ERC editors assign the real number when the pull request is opened on ethereum/ERCs. Discussion will open on Ethereum
@@ -26,6 +30,9 @@ lenders share a revenue address in a clear order, and lets payers, explorers and
 | `src/IRepayFirstPayee.sol` | The payee and creditor interfaces |
 | `src/RepayFirstPayee.sol` | A reference payee, and a factory that deploys one per agent at a CREATE2 address (not audited) |
 | `test/RepayFirstPayee.t.sol` | Foundry tests, with failing, greedy and gas-burning creditors |
+| `src/IHoldersAfterCreditors.sol` | The interface of the optional "Paying holders after creditors" section |
+| `src/HoldersAfterCreditorsToken.sol` | A reference ERC-7254 token that is a payee's beneficiary and books what it receives with `syncFromPayee` (not audited) |
+| `test/HoldersAfterCreditors.t.sol` | Foundry tests: holders share only what creditors leave, syncs book once, and the token's place after a sale |
 | `scripts/lint-erc.sh` | Lints the ERC text with eipw the way the ethereum/ERCs CI does |
 | `eipw.toml` | The ethereum/ERCs repository's eipw configuration, copied as is |
 
