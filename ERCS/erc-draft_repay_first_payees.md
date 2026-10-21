@@ -1,9 +1,9 @@
 ---
-eip: 8451
+eip: 99902
 title: Agent Repay-First Payees
 description: A revenue address for an agent identity that pays its creditors before its owner
 author: Priors contributors (@priors-agents)
-discussions-to: https://ethereum-magicians.org/t/erc-8451-agent-repay-first-payees/30025
+discussions-to: https://ethereum-magicians.org/t/erc-tba-agent-repay-first-payees/30025
 status: Draft
 type: Standards Track
 category: ERC
