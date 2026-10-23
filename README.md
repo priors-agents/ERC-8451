@@ -11,9 +11,9 @@ An optional section, "Paying holders after creditors", lets an agent pay the hol
 token from what its creditors leave: the token is the payee's beneficiary, never a creditor, and books what a sweep
 sends it with `syncFromPayee`, so lenders stay senior and holders come last.
 
-**Status: draft, not submitted.** The text is in
-[`ERCS/erc-draft_repay_first_payees.md`](ERCS/erc-draft_repay_first_payees.md). Its `eip: 99902` is a placeholder: the
-ERC editors assign the real number when the pull request is opened on ethereum/ERCs. Discussion: [Ethereum
+**Status: draft, submitted as [ethereum/ERCs#2108](https://github.com/ethereum/ERCs/pull/2108).** The text is in
+[`ERCS/erc-draft_repay_first_payees.md`](ERCS/erc-draft_repay_first_payees.md). Its `eip: 99902` is a placeholder until
+the ERC editors assign a number. Discussion: [Ethereum
 Magicians](https://ethereum-magicians.org/t/erc-tba-agent-repay-first-payees/30025).
 
 ## Why
