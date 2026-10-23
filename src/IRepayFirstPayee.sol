@@ -10,6 +10,8 @@ interface IRepayFirstPayee {
     event CreditorRemoved(address indexed creditor);
     event BeneficiarySet(address indexed beneficiary);
     event Swept(address indexed token, uint256 toCreditors, uint256 forwarded);
+    /// @notice A sweep changed what the payee holds for `creditor` in `token`; `amount` is the new figure.
+    event Reserved(address indexed creditor, address indexed token, uint256 amount);
 
     /// @notice The ERC-721 identity registry `agentId()` belongs to.
     function identityRegistry() external view returns (address);
@@ -28,6 +30,10 @@ interface IRepayFirstPayee {
     /// @notice The most of one sweep's balance `creditor` may take, in basis points; 0 if it is not a creditor.
     function maxShareBps(address creditor) external view returns (uint16);
 
+    /// @notice What this payee holds for `creditor` in `token`: offered to it by sweeps, within its share and what it was
+    ///         owed, and not yet taken. As the last sweep of `token` left it; 0 if it is not a creditor.
+    function reserved(address creditor, address token) external view returns (uint256);
+
     /// @notice Adds a creditor, junior to every existing one. The agent's owner only.
     function addCreditor(address creditor, uint16 maxShareBps) external;
 
@@ -39,8 +45,9 @@ interface IRepayFirstPayee {
     ///         zero address means the agent's owner.
     function setBeneficiary(address beneficiary) external;
 
-    /// @notice Pays the creditors from this payee's balance of `token`, most senior first, then forwards the rest to
-    ///         the beneficiary (or keeps it while the beneficiary is the zero address). Anyone may call it.
+    /// @notice Pays the creditors from this payee's balance of `token`, most senior first, keeps for each what it is
+    ///         offered and does not take (up to what it is owed), then forwards the rest to the beneficiary (or keeps it
+    ///         while the beneficiary is the zero address). Anyone may call it.
     function sweep(address token) external returns (uint256 toCreditors, uint256 forwarded);
 }
 
@@ -53,6 +60,6 @@ interface IRepayFirstCreditor {
     function hasClaim(uint256 agentId) external view returns (bool);
 
     /// @notice Takes at most `amount` of `token` from the calling payee (it has approved that much) and applies it to
-    ///         what `agentId` owes. Returns the amount taken.
+    ///         what `agentId` owes. Returns the amount taken. What it leaves stays in the payee's reserve for it.
     function collect(uint256 agentId, address token, uint256 amount) external returns (uint256 applied);
 }

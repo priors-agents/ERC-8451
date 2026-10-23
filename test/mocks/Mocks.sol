@@ -59,6 +59,7 @@ contract MockToken {
 contract MockCreditor is IRepayFirstCreditor {
     mapping(uint256 => uint256) public owed;
     uint256 public takeBps = 10_000; // how much of what it is given it actually takes
+    bool public down; // while set, `amountOwed` reverts
 
     function setOwed(uint256 agentId, uint256 amount) external {
         owed[agentId] = amount;
@@ -68,7 +69,12 @@ contract MockCreditor is IRepayFirstCreditor {
         takeBps = bps;
     }
 
+    function setDown(bool down_) external {
+        down = down_;
+    }
+
     function amountOwed(uint256 agentId, address) external view returns (uint256) {
+        require(!down, "down");
         return owed[agentId];
     }
 
@@ -81,6 +87,65 @@ contract MockCreditor is IRepayFirstCreditor {
         if (applied > owed[agentId]) applied = owed[agentId];
         owed[agentId] -= applied;
         require(MockToken(token).transferFrom(msg.sender, address(this), applied), "pull failed");
+    }
+}
+
+/// @notice A lender that closes a loan only in full, as the Agent Credit Lines draft's `repay` does: it takes the whole
+///         amount due from the caller or reverts. A defaulted loan, like a repaid one, has nothing due.
+contract FullRepaymentLender {
+    MockToken public immutable asset;
+    mapping(uint256 => uint256) private _due;
+
+    constructor(MockToken asset_) {
+        asset = asset_;
+    }
+
+    function open(uint256 loanId, uint256 due) external {
+        _due[loanId] = due;
+    }
+
+    function amountDue(uint256 loanId) external view returns (uint256) {
+        return _due[loanId];
+    }
+
+    function repay(uint256 loanId, uint256 maxDue) external returns (uint256 paid) {
+        paid = _due[loanId];
+        require(paid != 0, "not active");
+        require(paid <= maxDue, "due above max");
+        delete _due[loanId];
+        require(asset.transferFrom(msg.sender, address(this), paid), "pull failed");
+    }
+
+    function markDefault(uint256 loanId) external {
+        delete _due[loanId];
+    }
+}
+
+/// @notice A direct creditor for a `FullRepaymentLender` loan, with no reserve of its own: it reports the amount due and
+///         repays the loan with what it is given, so its `collect` reverts unless that covers the whole amount due.
+contract FullRepaymentCreditor is IRepayFirstCreditor {
+    FullRepaymentLender public immutable lender;
+    uint256 public immutable loanId;
+
+    constructor(FullRepaymentLender lender_, uint256 loanId_) {
+        lender = lender_;
+        loanId = loanId_;
+    }
+
+    function amountOwed(uint256, address token) external view returns (uint256) {
+        return token == address(lender.asset()) ? lender.amountDue(loanId) : 0;
+    }
+
+    function hasClaim(uint256) external view returns (bool) {
+        return lender.amountDue(loanId) != 0;
+    }
+
+    function collect(uint256, address token, uint256 amount) external returns (uint256) {
+        MockToken t = lender.asset();
+        require(token == address(t), "wrong asset");
+        require(t.transferFrom(msg.sender, address(this), amount), "pull failed");
+        t.approve(address(lender), amount);
+        return lender.repay(loanId, amount);
     }
 }
 

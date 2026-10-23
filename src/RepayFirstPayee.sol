@@ -20,7 +20,9 @@ interface IERC165 {
 /// @title RepayFirstPayee
 /// @notice Reference implementation of the Agent Repay-First Payees draft. One payee per agent, deployed at a CREATE2
 ///         address by `RepayFirstPayeeFactory`. Each creditor is called with a fixed gas budget, so one that fails or
-///         burns gas is skipped and the rest of the sweep goes on.
+///         burns gas is skipped and the rest of the sweep goes on. What a creditor is offered and does not take stays
+///         here in its reserve, up to what it is owed, and is offered again at each sweep: a lender that takes only
+///         full repayment is repaid once its reserve covers what is due.
 /// @dev Not audited. A reference for the interface, not a contract to hold real revenue.
 contract RepayFirstPayee is IRepayFirstPayee, IERC165 {
     uint256 public constant MAX_CREDITORS = 8;
@@ -36,6 +38,11 @@ contract RepayFirstPayee is IRepayFirstPayee, IERC165 {
     address private _beneficiarySetBy; // the owner who chose `_beneficiary`; the choice holds only while it owns
     address[] private _creditors;
     mapping(address => uint16) private _share;
+    /// @dev Reserves are kept under the place a creditor was given when added (never reused), so removing it ends all
+    ///      its reserves at once, whatever the tokens, and a creditor added again starts with none.
+    mapping(address => uint256) private _place;
+    uint256 private _places;
+    mapping(uint256 => mapping(address => uint256)) private _reserve; // place => token => amount
     bool private _locked;
 
     error NotOwner();
@@ -94,6 +101,11 @@ contract RepayFirstPayee is IRepayFirstPayee, IERC165 {
         return _share[creditor];
     }
 
+    function reserved(address creditor, address token) external view returns (uint256) {
+        uint256 place = _place[creditor];
+        return place == 0 ? 0 : _reserve[place][token];
+    }
+
     function supportsInterface(bytes4 interfaceId) external pure returns (bool) {
         return interfaceId == type(IRepayFirstPayee).interfaceId || interfaceId == type(IERC165).interfaceId;
     }
@@ -106,6 +118,7 @@ contract RepayFirstPayee is IRepayFirstPayee, IERC165 {
         if (_creditors.length >= MAX_CREDITORS) revert TooManyCreditors();
         _creditors.push(creditor);
         _share[creditor] = maxShareBps_;
+        _place[creditor] = ++_places;
         emit CreditorAdded(creditor, maxShareBps_);
     }
 
@@ -126,6 +139,7 @@ contract RepayFirstPayee is IRepayFirstPayee, IERC165 {
             }
         }
         delete _share[creditor];
+        delete _place[creditor]; // its reserves end: the next sweep counts them as balance outside any reserve
         emit CreditorRemoved(creditor);
     }
 
@@ -139,30 +153,18 @@ contract RepayFirstPayee is IRepayFirstPayee, IERC165 {
 
     function sweep(address token) external lock returns (uint256 toCreditors, uint256 forwarded) {
         IERC20Approve t = IERC20Approve(token);
-        uint256 total = t.balanceOf(address(this));
-        if (total == 0) return (0, 0);
+        if (t.balanceOf(address(this)) == 0) return (0, 0);
 
+        (uint256[] memory owed, uint256[] memory held, uint256 total) = _owedAndHeld(t);
         uint256 remaining = total;
-        uint256 n = _creditors.length;
-        for (uint256 i; i < n && remaining > 0; ++i) {
+        for (uint256 i; i < owed.length; ++i) {
             address c = _creditors[i];
-            uint256 give = _owed(c, token);
+            uint256 give = owed[i] - held[i];
             uint256 cap = total * _share[c] / BPS;
             if (give > cap) give = cap;
             if (give > remaining) give = remaining;
-            if (give == 0) continue;
-
-            uint256 before = t.balanceOf(address(this));
-            if (!t.approve(c, give)) revert TransferFailed();
-            try IRepayFirstCreditor(c).collect{gas: COLLECT_GAS}(_agentId, token, give) {} catch {}
-            if (!t.approve(c, 0)) revert TransferFailed();
-
-            // What the creditor took: the fall in balance, at most `give` by the allowance. Tokens sent in meanwhile
-            // stay for the next sweep.
-            uint256 after_ = t.balanceOf(address(this));
-            uint256 taken = after_ < before ? before - after_ : 0;
-            toCreditors += taken;
-            remaining -= taken;
+            remaining -= give;
+            toCreditors += _settle(t, c, held[i] + give);
         }
 
         address to = beneficiary();
@@ -171,6 +173,47 @@ contract RepayFirstPayee is IRepayFirstPayee, IERC165 {
             if (forwarded > 0 && !t.transfer(to, forwarded)) revert TransferFailed();
         }
         emit Swept(token, toCreditors, forwarded);
+    }
+
+    /// @dev What each creditor is owed now; its reserve lowered to that, so a reserve above what is owed is released; and
+    ///      B, the balance outside the reserves: what arrived since the last sweep and what was released.
+    function _owedAndHeld(IERC20Approve t)
+        private
+        view
+        returns (uint256[] memory owed, uint256[] memory held, uint256 total)
+    {
+        uint256 n = _creditors.length;
+        owed = new uint256[](n);
+        held = new uint256[](n);
+        uint256 inReserve;
+        for (uint256 i; i < n; ++i) {
+            address c = _creditors[i];
+            owed[i] = _owed(c, address(t));
+            uint256 r = _reserve[_place[c]][address(t)];
+            held[i] = r < owed[i] ? r : owed[i];
+            inReserve += held[i];
+        }
+        uint256 balance = t.balanceOf(address(this));
+        total = balance > inReserve ? balance - inReserve : 0;
+    }
+
+    /// @dev Approves exactly `offer`, calls `collect`, resets the approval, and keeps in the creditor's reserve what it
+    ///      did not take. What it took is the fall in balance, at most `offer` by the allowance; tokens sent in
+    ///      meanwhile stay for the next sweep.
+    function _settle(IERC20Approve t, address creditor, uint256 offer) private returns (uint256 taken) {
+        if (offer != 0) {
+            uint256 before = t.balanceOf(address(this));
+            if (!t.approve(creditor, offer)) revert TransferFailed();
+            try IRepayFirstCreditor(creditor).collect{gas: COLLECT_GAS}(_agentId, address(t), offer) {} catch {}
+            if (!t.approve(creditor, 0)) revert TransferFailed();
+            uint256 after_ = t.balanceOf(address(this));
+            taken = after_ < before ? before - after_ : 0;
+        }
+        mapping(address => uint256) storage reserve = _reserve[_place[creditor]];
+        if (reserve[address(t)] != offer - taken) {
+            reserve[address(t)] = offer - taken;
+            emit Reserved(creditor, address(t), offer - taken);
+        }
     }
 
     function _owed(address creditor, address token) private view returns (uint256 owed) {

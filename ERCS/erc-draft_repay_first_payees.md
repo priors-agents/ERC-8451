@@ -16,11 +16,12 @@ requires: 20, 165, 721, 7254
 This proposal defines a payee: a contract that an agent identity, held in an [ERC-721](./eip-721.md) identity registry,
 uses as the address where it is paid. When the payee is swept, it pays each registered creditor what that creditor says
 it is owed, most senior first and up to a share of the swept balance the creditor agreed to, and forwards the rest to the
-agent's owner or an address the owner chose. The owner adds creditors, each junior to the ones before, and cannot remove
-a creditor that still has a claim. A small creditor interface lets any lender take part, and any payer, explorer or
-lender can tell that an identity's revenue address is encumbered. An optional part lets the holders of an
-[ERC-7254](./eip-7254.md) revenue-sharing token share what the creditors leave, with the token as the payee's
-beneficiary.
+agent's owner or an address the owner chose. What a creditor does not take, up to what it is owed, stays in the payee in
+reserve for it, so a lender that takes repayment only in full is repaid once its reserve covers what is due. The owner
+adds creditors, each junior to the ones before, and cannot remove a creditor that still has a claim. A small creditor
+interface lets any lender take part, and any payer, explorer or lender can tell that an identity's revenue address is
+encumbered. An optional part lets the holders of an [ERC-7254](./eip-7254.md) revenue-sharing token share what the
+creditors leave, with the token as the payee's beneficiary.
 
 ## Motivation
 
@@ -51,12 +52,14 @@ interface IRepayFirstPayee {
     event CreditorRemoved(address indexed creditor);
     event BeneficiarySet(address indexed beneficiary);
     event Swept(address indexed token, uint256 toCreditors, uint256 forwarded);
+    event Reserved(address indexed creditor, address indexed token, uint256 amount);
 
     function identityRegistry() external view returns (address);
     function agentId() external view returns (uint256);
     function beneficiary() external view returns (address);
     function creditors() external view returns (address[] memory);
     function maxShareBps(address creditor) external view returns (uint16);
+    function reserved(address creditor, address token) external view returns (uint256);
     function addCreditor(address creditor, uint16 maxShareBps) external;
     function removeCreditor(address creditor) external;
     function setBeneficiary(address beneficiary) external;
@@ -81,6 +84,8 @@ interface IRepayFirstCreditor {
 - `creditors()` MUST return the creditors in order of seniority: the earliest added first.
 - `maxShareBps(creditor)` MUST return the share given when the creditor was added, and `0` for an address that is not a
   creditor.
+- `reserved(creditor, token)` MUST return the creditor's reserve in `token` (see Sweeping) as the last sweep of `token`
+  left it, and `0` for an address that is not a creditor.
 
 ### Adding and removing creditors
 
@@ -89,33 +94,44 @@ interface IRepayFirstCreditor {
   after every existing one and emit `CreditorAdded`. A payee MAY cap the number of creditors.
 - `removeCreditor(creditor)` MUST succeed when called by `creditor` itself. When called by the owner it MUST revert if
   the creditor's `hasClaim(agentId())` returns `true` or reverts. It MUST revert for any other caller. It MUST keep the
-  order of the remaining creditors and emit `CreditorRemoved`.
+  order of the remaining creditors and emit `CreditorRemoved`. It MUST end the creditor's reserves in every token: what
+  they held counts in `B` at the next sweep. A creditor added again starts with no reserve.
 - A creditor's share and position MUST NOT change while it remains a creditor.
 - `setBeneficiary(beneficiary)` MUST revert unless called by the owner, and MUST emit `BeneficiarySet`.
 
 ### Sweeping
 
-`sweep(token)` MUST be callable by any account. With `B` the payee's balance of the [ERC-20](./eip-20.md) `token` at the
-start of the call, it MUST, for each creditor in order of seniority while some of `B` remains:
+The payee keeps, for each creditor and token, a **reserve**: what sweeps offered the creditor in that token and the
+creditor did not take. Only a sweep or the creditor's removal changes it.
 
-1. compute `give` as the least of the creditor's `amountOwed(agentId(), token)`, `B * maxShareBps(creditor) / 10000`
-   (rounded down), and what remains of `B`;
-2. if `give` is not zero, approve the creditor for exactly `give`, call `collect(agentId(), token, give)`, then set the
-   approval back to zero;
-3. count as paid to that creditor the decrease of the payee's balance across the call.
+`sweep(token)` MUST be callable by any account. It MUST first read, for each creditor, `owed`, its
+`amountOwed(agentId(), token)`, and lower the creditor's reserve in `token` to `owed` where the reserve is greater. With
+`B` the payee's balance of the [ERC-20](./eip-20.md) `token` at the start of the call less the creditors' reserves in
+`token` so lowered (zero if they are greater), it MUST then, for each creditor in order of seniority:
+
+1. compute `give` as the least of `owed` less the creditor's reserve, `B * maxShareBps(creditor) / 10000` (rounded
+   down), and what remains of `B`, and deduct `give` from what remains of `B`;
+2. with `offer` the creditor's reserve plus `give`, if `offer` is not zero, approve the creditor for exactly `offer`,
+   call `collect(agentId(), token, offer)`, then set the approval back to zero;
+3. count as paid to that creditor the decrease of the payee's balance across the call, and set its reserve to `offer`
+   less what it was paid.
 
 Then, unless `beneficiary()` is the zero address, it MUST transfer what remains of `B` to `beneficiary()`; when it is
-the zero address, what remains stays in the payee and counts as not forwarded. It MUST emit `Swept` with the totals and
-return them. A creditor
-whose `amountOwed` or `collect` reverts MUST be treated as owed nothing for that sweep; the sweep MUST go on. A payee
-SHOULD call each creditor with a bounded amount of gas, so that one creditor cannot make every sweep fail.
+the zero address, what remains stays in the payee, outside any reserve, and counts as not forwarded. It MUST emit
+`Reserved` for each creditor whose reserve in `token` the call changed, with the new reserve, and `Swept` with the
+totals, and return them. A creditor whose `amountOwed` reverts MUST be treated as owed nothing for that sweep, which
+releases its reserve. A creditor whose `collect` reverts is paid nothing, and what it was offered stays in its reserve.
+In both cases the sweep MUST go on. A payee SHOULD call each creditor with a bounded amount of gas, so that one creditor
+cannot make every sweep fail.
 
 ### The creditor
 
-- `amountOwed(agentId, token)` MUST return what the identity owes the creditor in `token` and may be paid now.
+- `amountOwed(agentId, token)` MUST return what the identity owes the creditor in `token` and may be paid now. A
+  creditor that accepts a payment only when it settles a debt in full returns the whole amount that settles it.
 - `hasClaim(agentId)` MUST return `true` while the creditor has any claim on the identity, due or not.
 - `collect(agentId, token, amount)` MUST take at most `amount` of `token` from the calling payee and apply it to what
-  the identity owes; it MUST return the amount taken.
+  the identity owes; it MUST return the amount taken. It MUST NOT take what it cannot apply now in order to hold it for
+  a later repayment: what it leaves stays in the payee's reserve for it and is offered again at the next sweep.
 
 ### Paying holders after creditors (optional)
 
@@ -165,7 +181,17 @@ agent's revenue.
 - **A share per creditor.** A lender that takes all revenue can starve the agent of what it needs to keep working. The
   share lets the owner and the lender agree on how much of each payment services the debt.
 - **The creditor applies the money.** Only the creditor knows which of its loans a payment repays and how. Approving
-  exactly `give` and measuring the balance keeps the payee correct whatever the creditor does.
+  exactly `offer` and measuring the balance keeps the payee correct whatever the creditor does.
+- **A reserve in the payee, not a forward.** Some lenders take a repayment only in full: a loan opens once and closes
+  once. If a sweep forwarded what such a lender could not take yet, ten payments of 10 would all reach the owner while
+  100 stayed due, and only a single payment of 100 would repay it. The payee keeps what a creditor does not take and
+  offers it again at each sweep, so the loan is repaid once the reserve covers it. The money stays in the contract
+  whose rules the owner and the creditor already rely on: neither can move it outside a sweep, and the creditor stays a
+  thin adapter. A reserve held by the creditor would put the agent's money in the creditor's custody and count it as
+  paid before anything was repaid; requiring partial repayment would change how every lender accounts for its loans.
+- **A reserve follows what is owed.** The payee knows no due dates or defaults, only `amountOwed`. Lowering a reserve
+  to it at each sweep releases what a debt repaid from elsewhere, forgiven or closed no longer needs, and ending the
+  reserves with the creditor's place means a creditor that leaves takes nothing with it.
 - **Removal needs no claim.** The owner can drop a creditor it no longer uses, but not one that is still owed, which is
   what makes the payee worth lending against. A creditor whose claim check fails is treated as owed, so it cannot be
   dropped by making it unreachable.
@@ -208,8 +234,19 @@ A conforming payee passes these cases, each for one identity whose owner receive
 - With one creditor owed 50 units at a share of 2000, a sweep of 100 units pays it 20 units and forwards 80 units.
 - With two creditors owed 60 units each at a share of 10000, a sweep of 100 units pays the first 60 units and the second
   40 units, and forwards nothing.
-- A creditor whose calls revert, or that tries to take more than it was approved for, is paid nothing and the rest is
-  forwarded; the approval to every creditor is zero after the sweep.
+- A creditor whose calls revert is paid nothing, nothing is reserved for it, and the rest is forwarded.
+- A creditor at a share of 3000, owed more than 30 units, that tries to take more than it was approved for is paid
+  nothing on a sweep of 100 units; 30 units stay in its reserve and 70 units are forwarded. The approval to every
+  creditor is zero after each sweep.
+- With one creditor owed 50 units at a share of 10000 that takes half of what it is offered, a sweep of 100 units pays
+  it 25 units, keeps 25 units in its reserve and forwards 50 units.
+- With one creditor owed 100 units at a share of 10000 that takes a payment only when it covers all 100 units, each of
+  nine sweeps of 10 units pays it nothing and forwards nothing, and its reserve rises by 10 units each time, emitting
+  `Reserved`; a tenth sweep of 10 units pays it 100 units and leaves no reserve; a sweep of 100 units after that
+  forwards 100 units.
+- With 90 units in that creditor's reserve, once its loan is repaid from elsewhere, or defaulted and it reports nothing
+  owed, a sweep of 10 more units forwards 100 units and leaves no reserve. A reserve is released in the same way when
+  the creditor's `amountOwed` reverts, and when the creditor removes itself; added again, it starts with no reserve.
 - The owner cannot remove a creditor still owed; it can once the creditor is repaid; a creditor can always remove itself,
   and the others keep their order.
 - After the identity is transferred, the new owner is the default beneficiary and cannot remove a creditor still owed.
@@ -241,7 +278,8 @@ and 25% of its supply:
 
 `RepayFirstPayee` and a factory that deploys one payee per identity at a CREATE2 address known before deployment
 accompany this proposal with their tests. The payee calls each creditor with a fixed gas budget and holds at most eight
-creditors.
+creditors. It keys each creditor's reserves by the place it was given when added, never reused, so removing a creditor
+ends its reserves in every token without listing them.
 
 `HoldersAfterCreditorsToken`, an ERC-20 token that implements ERC-7254 and `IHoldersAfterCreditors`, accompanies the
 optional part with its tests. Its reward assets are fixed when it is deployed. Unlike ERC-7254's own reference, which
@@ -253,13 +291,23 @@ counts the remainder below one unit of a claim as withdrawn, it keeps that remai
   new address and route future revenue around the payee. Creditors SHOULD check, where the address is on chain (such as
   an ERC-8004 payment wallet), that it still points to the payee before each draw, and price the rest as unsecured.
 - **Creditors are trusted with their own figures.** A creditor reports its own `amountOwed`. A creditor the owner added
-  can over-report and take up to its share of every sweep. Owners SHOULD add only lenders they borrowed from.
-- **Creditor calls.** Creditors are external contracts; a payee MUST approve only `give`, MUST reset the approval, and
+  can over-report and take up to its share of every sweep, or leave it in its reserve, out of the owner's reach until
+  the creditor reports less or leaves. Owners SHOULD add only lenders they borrowed from.
+- **A reserve short of what is due.** A lender that takes repayment only in full is repaid when its reserve reaches
+  what is due. If the agent's revenue, within the lender's share, has not reached it by the due time, the loan runs late
+  with the reserve held. A creditor that reports nothing owed once its loan is defaulted releases the reserve to the
+  creditors after it and to the beneficiary; a creditor that means to recover from the reserve after a default SHOULD
+  keep reporting what it can recover, and apply what it takes as a recovery. Lenders SHOULD set the share and the term
+  so that the agent's expected revenue covers what is due before the due time.
+- **Creditor calls.** Creditors are external contracts; a payee MUST approve only `offer`, MUST reset the approval, and
   SHOULD bound the gas of each call and guard against re-entry into `sweep`, `addCreditor` and `removeCreditor`.
 - **Tokens.** Tokens that take a fee on transfer, rebase, or block addresses change what a sweep can pay. Balances are
-  measured, not assumed, so accounting stays correct, but a blocked creditor is skipped.
-- **Ownership changes.** A transfer of the identity transfers control of the payee with its creditors, and ends the
-  former owner's choice of beneficiary. Buyers SHOULD read `creditors()` and each creditor's `hasClaim` before buying.
+  measured, not assumed, so accounting stays correct, but a blocked creditor is paid nothing and what it is offered
+  stays in its reserve. A token whose balances fall on their own can leave the reserves above the balance; sweeps then
+  forward nothing until it covers them again.
+- **Ownership changes.** A transfer of the identity transfers control of the payee with its creditors and their
+  reserves, and ends the former owner's choice of beneficiary. Buyers SHOULD read `creditors()`, each creditor's
+  `hasClaim` and its `reserved` amounts before buying.
 - **A burned identity.** With no owner to read, no one can configure the payee. Sweeps still pay the creditors, and
   what is left stays in the payee rather than being sent to the zero address. Owners who may burn an identity SHOULD
   set a beneficiary first.
